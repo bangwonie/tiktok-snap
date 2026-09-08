@@ -34,9 +34,8 @@ async function cycleSources() {
 
 function run(source) {
   return new Promise(resolve => {
-    const args = ['collector.mjs', `--tag=${source.tag}`, `--region=${source.region}`, `--lang=${source.lang}`, `--limit=${config.limitPerTag || 50}`];
+    const args = ['collector.mjs', `--tag=${source.tag}`, `--region=${source.region}`, `--lang=${source.lang}`, `--limit=${config.limitPerTag ?? 'all'}`];
     if (!firstRun) args.push('--auto');
-    if (config.refreshSnapshots) args.push('--refresh');
     const child = spawn(process.execPath, args, { cwd: root, stdio: 'inherit' });
     child.on('error', error => { console.error(error.message); resolve(1); });
     child.on('exit', code => resolve(code ?? 1));

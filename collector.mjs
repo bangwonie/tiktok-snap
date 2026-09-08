@@ -1,3 +1,4 @@
+import { CrawlQueue, discoverFeed } from './feed-queue.mjs';
 import { chromium } from 'playwright';
 import { mkdir, writeFile, rename, appendFile, rm, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
@@ -8,6 +9,8 @@ import { createInterface } from 'node:readline/promises';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { isMp4, isComplete } from './archive-logic.mjs';
+import { ensureCompatible } from './media-compat.mjs';
+import { listVideos, videoFolder, saveChannel, migrateArchive } from './archive-layout.mjs';
 import { excludedSource, vietnamReason } from './content-filter.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
@@ -22,12 +25,20 @@ const tag = option('--tag', 'viralusa').replace(/^#/, '');
 const region = option('--region', 'US').toUpperCase();
 const language = option('--lang', 'en');
 if (excludedSource({ tag, region, lang: language })) throw new Error('Nguon Viet Nam da bi loai khoi crawler.');
-const limit = Number(option('--limit', '20'));
+const limitOption = option('--limit', 'all');
+const limit = limitOption === 'all' ? Infinity : Number(limitOption);
 const autoMode = args.includes('--auto');
-const refreshMode = args.includes('--refresh');
-if (!tag || !Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error('Use --tag fyp --limit 20 (limit: 1–500).');
+const discoveryOnly = args.includes('--discover-only');
+const discoveryPages = Number(option('--discovery-pages', 'Infinity'));
+if (!(discoveryPages > 0) || (discoveryPages !== Infinity && !Number.isSafeInteger(discoveryPages))) throw new Error('Invalid --discovery-pages');
+let stopDiscovery = false;
+let producer;
+let discoveryPage;
+
+if (!tag || (limit !== Infinity && (!Number.isSafeInteger(limit) || limit < 1))) throw new Error('Use --tag fyp --limit 20 (limit: 1–500).');
 const archive = path.join(root, 'archive');
 await mkdir(archive, { recursive: true });
+await migrateArchive(archive);
 const prompt = async message => {
   const input = createInterface({ input: process.stdin, output: process.stdout });
   try { await input.question(message); } finally { input.close(); }
@@ -191,32 +202,13 @@ try {
       await navigate(page, `https://www.tiktok.com/tag/${encodeURIComponent(tag)}?lang=${encodeURIComponent(language)}`);
       await gate(page);
     }
-    const links = new Set();
-    let idle = 0;
-    // Bounded discovery; TikTok's displayed order, not a global view-count ranking.
-    for (let round = 0; round < 30 && links.size < limit * 3 && idle < 5; round++) {
-      await page.waitForTimeout(2200);
-      await gate(page);
-      const before = links.size;
-      for (const url of await page.locator('a[href*="/video/"]').evaluateAll(nodes => nodes
-        .map(n => ({ href: n.href, rect: n.getBoundingClientRect() }))
-        .filter(n => n.rect.width > 0 && n.rect.height > 0)
-        .sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left)
-        .map(n => n.href))) {
-        if (/^https:\/\/www\.tiktok\.com\/@[^/]+\/video\/\d+/.test(url)) links.add(url.split('?')[0]);
-      }
-      idle = links.size === before ? idle + 1 : 0;
-      await page.mouse.wheel(0, 1400);
-    }
-    console.log(`Tim thay ${links.size} video cho #${tag}.`);
-    if (!links.size) throw new Error('Khong tim thay video. Kiem tra trang TikTok/dang nhap/xac minh; giao dien co the da thay doi.');
     const backlog = [];
-    for (const entry of await readdir(archive, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      if (!/^\d+$/.test(entry.name)) continue;
-      const oldFolder = path.join(archive, entry.name);
+    const archivedFolders = await listVideos(archive);
+    const videoIndex = new Map(archivedFolders.map(folder => [path.basename(folder), folder]));
+    for (const oldFolder of archivedFolders) {
       if (await isComplete(oldFolder)) continue;
       const oldMetadata = await readJson(path.join(oldFolder, 'metadata.json'));
+      if (oldMetadata?.tag?.toLowerCase() !== tag.toLowerCase()) continue;
       if (oldMetadata && (excludedSource({ region: oldMetadata.sourceRegion, lang: oldMetadata.language, tag: oldMetadata.tag }) || vietnamReason(oldMetadata))) continue;
       if (typeof oldMetadata?.url === 'string' && /^https:\/\/www\.tiktok\.com\/@[^/]+\/video\/\d+$/.test(oldMetadata.url)) backlog.push(oldMetadata.url);
     }
@@ -229,12 +221,44 @@ try {
     let consecutiveFailures = 0;
     // TikTok/Akamai rate-limits rapid detail navigations. Keep requests human-paced.
     const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-    for (const url of new Set([...backlog, ...links])) {
+    const queue = await CrawlQueue.open(archive, tag, region);
+    for (const url of backlog) {
+      const id = url.match(/\/video\/(\d+)/)[1];
+      if (!queue.data.jobs[id]) queue.data.jobs[id] = { id, url, status: 'pending', source: 'archive' };
+      else if (queue.data.jobs[id].status === 'done') queue.data.jobs[id].status = 'pending';
+    }
+    await queue.save();
+    discoveryPage = await context.newPage();
+    await discoveryPage.setExtraHTTPHeaders({ 'Accept-Language': `${language},en;q=0.8` });
+    let discoveryDone = false;
+    let discoveryError;
+    producer = (async () => {
+      await discoverFeed({ page: discoveryPage, queue, source: `tag:${tag}`, url: `https://www.tiktok.com/tag/${encodeURIComponent(tag)}?lang=${encodeURIComponent(language)}`,
+        gate, stopped: () => stopDiscovery, maxPages: discoveryPages });
+      if (!args.includes('--no-profiles') && !stopDiscovery && discoveryPages === Infinity) {
+        for (const username of Object.keys(queue.data.authors)) {
+          if (stopDiscovery) break;
+          await discoverFeed({ page: discoveryPage, queue, source: `user:${username}`, profile: true,
+            url: `https://www.tiktok.com/@${encodeURIComponent(username)}`, gate, stopped: () => stopDiscovery });
+        }
+      }
+    })().catch(error => { discoveryError = error; }).finally(() => { discoveryDone = true; });
+    async function* queuedUrls() {
+      const attempted = new Set();
+      while (true) {
+        const pending = Object.values(queue.data.jobs).filter(job => ['pending', 'failed'].includes(job.status) && !attempted.has(job.id));
+        for (const job of pending) { attempted.add(job.id); yield job.url; }
+        if (discoveryDone) return;
+        await pause(500);
+      }
+    }
+    if (discoveryOnly) { await producer; console.log(`Queue: ${Object.keys(queue.data.jobs).length} IDs; ${queue.file}`); }
+    for await (const url of discoveryOnly ? [] : queuedUrls()) {
       if (saved >= limit) break;
       const id = url.match(/\/video\/(\d+)/)[1];
-      const folder = path.join(archive, id);
+      const folder = videoIndex.get(id) || videoFolder(archive, decodeURIComponent(new URL(url).pathname.split('/')[1].slice(1)), id);
       const completed = await isComplete(folder);
-      if (completed && !refreshMode) continue;
+      if (completed) { await ensureCompatible(path.join(folder, 'video.mp4')); await queue.mark(id, 'done'); continue; }
       try {
         await navigate(detail, url);
         await gate(detail);
@@ -258,6 +282,7 @@ try {
         }
         const exclusionReason = vietnamReason(item);
         if (exclusionReason) {
+          await queue.mark(id, 'excluded');
           excluded++;
           consecutiveFailures = 0;
           console.log(`Bo qua ${id}: ${exclusionReason}`);
@@ -291,18 +316,22 @@ try {
             throw new Error('yt-dlp output is not a valid MP4.');
           }
         }
+        await ensureCompatible(path.join(folder, 'video.mp4'));
         // Prefer author data embedded in the video response; avoid an extra profile navigation.
         const profileUrl = `https://www.tiktok.com/@${encodeURIComponent(username)}`;
         const profile = find(await state(detail), v => v.user?.uniqueId === username && v.stats);
         const bio = author.signature ?? profile?.user?.signature ?? null;
-        await json(path.join(folder, 'channel.json'), { username, url: profileUrl, bio,
+        await saveChannel(path.dirname(folder), { username, url: profileUrl, bio,
           nickname: profile?.user?.nickname ?? author.nickname, stats: profile?.stats ?? null, capturedAt: new Date().toISOString() });
         await json(path.join(folder, 'complete.json'), { savedAt: new Date().toISOString() });
+        await queue.mark(id, 'done');
         saved++;
         consecutiveFailures = 0;
-        console.log(`[${saved}/${limit}] ${completed ? 'Da cap nhat' : 'Da luu'} ${id} @${username}`);
+        console.log(`[${saved}/${limit === Infinity ? 'all' : limit}] Da luu ${id} @${username}`);
+        if (saved >= limit) break;
         await pause(2500 + Math.floor(Math.random() * 2500));
       } catch (error) {
+        await queue.mark(id, 'failed');
         failed++;
         consecutiveFailures++;
         const message = String(error.message).replace(/https?:\/\/\S+/g, '[URL]');
@@ -316,7 +345,10 @@ try {
       }
       await detail.waitForTimeout(2000);
     }
+    stopDiscovery = true;
+    await producer;
+    if (discoveryError) { console.error(`Discovery chua hoan tat: ${discoveryError.message}`); process.exitCode = 1; }
     console.log(`Hoan tat: ${saved} video; ${excluded} bi loai (VN); ${failed} loi. Kho: ${archive}`);
     if (failed && !saved) process.exitCode = 1;
   }
-} finally { await browser.close(); }
+} finally { stopDiscovery = true; await producer; await discoveryPage?.close(); await browser.close(); }

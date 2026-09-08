@@ -17,5 +17,5 @@ export async function isMp4(file) {
 export async function isComplete(folder) {
   const present = file => access(path.join(folder, file)).then(() => true, () => false);
   return await present('complete.json') && await present('metadata.json') &&
-    await present('channel.json') && await isMp4(path.join(folder, 'video.mp4'));
+    (await present('channel.json') || await present('../channel.json')) && await isMp4(path.join(folder, 'video.mp4'));
 }

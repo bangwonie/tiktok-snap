@@ -1,37 +1,58 @@
-# TikTok Snap
+﻿# TikTok Snap
 
-Tool nội bộ chạy bằng Node.js và Google Chrome. Mặc định mở hashtag `#fyp`, tự lướt, mở video, tải MP4 và lưu bio kênh. Không duyệt từng video.
-
-```powershell
-cd D:\Downloads\tiktok_snap
-npm install
-npm start
-```
-
-Chạy liên tục nhiều nguồn bằng một lệnh:
+Crawler Node.js + Chrome: lấy danh sách video qua JSON phân trang, lưu hàng đợi trên đĩa và tải MP4 bằng yt-dlp. Mặc định chỉ tải mới, bỏ qua video hoàn tất, không cập nhật snapshot cũ. Bộ lọc nguồn/nội dung Việt Nam vẫn áp dụng.
 
 ```powershell
-npm run watch
+npm start -- --tag=livecanbeeasy --region=US --lang=en-US --limit=all --auto
 ```
 
-Cấu hình nằm trong `watch.config.json`: `sources` chia hashtag theo khu vực và ngôn ngữ, `limitPerTag` là số video xử lý mỗi hashtag trong một chu kỳ, và `intervalMinutes` là thời gian giữa các chu kỳ. Trước mỗi chu kỳ, `discover.mjs` mở TikTok Creative Center, lấy hashtag đang nổi trong 7 ngày cho từng vùng rồi gộp với danh sách cố định. `tagsPerRegion` điều chỉnh số hashtag động mỗi vùng. Nếu nguồn chính thức lỗi, crawler dùng danh sách cố định. Lần đầu tool chờ anh xác minh rồi nhấn Enter; các lượt sau tự chạy. Nhấn Ctrl+C để dừng.
+`npm run watch` khám phá hashtag trending rồi chạy từng nguồn trong `watch.config.json`. `limitPerTag: "all"` không giới hạn số video. Không có giới hạn 30 vòng cuộn.
 
-Mỗi lượt gửi ngôn ngữ phù hợp và ghi `sourceRegion` vào metadata. Đây là chiến lược khám phá đa khu vực, không phải giả lập IP: TikTok vẫn có thể cá nhân hóa theo IP Việt Nam. Muốn kết quả độc lập theo quốc gia cần proxy hợp lệ ở từng khu vực hoặc nguồn dữ liệu chính thức. TikTok Creative Center là nguồn chính thức để đối chiếu hashtag, video và creator đang nổi theo vùng.
+## Cách lấy dữ liệu
 
-Tool tự mở Google Chrome với hồ sơ `.chrome-profile/` và cổng debug nếu chưa có Chrome debug. Anh chỉ cần xác minh/mở TikTok trên cửa sổ đó rồi nhấn Enter ở terminal. Lấy video theo thứ tự hiển thị từ trên xuống, trái sang phải từng hàng.
+- Bắt JSON `/api/challenge/item_list/` của đúng tab hashtag, lưu ID và cursor sau mỗi trang trước khi tải.
+- Thử cursor bằng phiên Chrome hiện tại. Nếu phản hồi rỗng/không hợp lệ, tiếp tục phát sinh request qua cuộn trang Chrome. Không coi HTTP 200 rỗng là hết dữ liệu.
+- Luồng tìm danh sách và luồng tải chạy đồng thời. Hàng đợi trong `archive/queues/` chỉ lưu URL video, ID, trạng thái, tác giả và cursor; không lưu cookie hoặc URL request chứa tham số phiên.
+- Sau lượt hashtag, duyệt kênh các tác giả đã tìm được qua `/api/post/item_list/`, chỉ thêm video có đúng hashtag. Dùng `--no-profiles` để tắt bước bổ sung này.
+- `exhausted` chỉ có nghĩa phản hồi hợp lệ báo `hasMore=false` cho nguồn đó. Nếu không tiến triển sau 10 lần thử, trạng thái là `retry`, không phải đã lấy đủ posts. Chạy lại sẽ đọc hàng đợi còn dở; thử cursor cũ rồi dùng phân trang Chrome nếu cursor không hoạt động.
+- Video lỗi được giữ để thử lại lần chạy sau. Sau 10 lỗi tải liên tiếp, lượt tải dừng và hàng đợi được giữ nguyên.
 
-Video được tải bằng `yt-dlp` với format tốt nhất mà TikTok cung cấp, ưu tiên nguồn không watermark khi extractor có nguồn đó. Máy hiện tại đã có `yt-dlp` và `ffmpeg`; có thể cập nhật bằng `yt-dlp -U`. TikTok quyết định các format trả về nên không thể bảo đảm mọi video đều có bản không watermark.
+## Kiểm tra ngắn
 
 ```powershell
-npm start -- --tag fyp --limit 20
+npm run check
+npm test
+npm start -- --tag=livecanbeeasy --region=US --auto --discover-only --discovery-pages=3
+npm start -- --tag=livecanbeeasy --region=US --auto --limit=1 --no-profiles
 ```
 
-Mỗi video nằm trong `archive/<video-id>/`: `video.mp4`, `metadata.json` (caption, link, số liệu), `channel.json` (bio và số liệu kênh nếu có), `snapshots.jsonl` (lịch sử tương tác), `complete.json`. Chế độ `watch` cập nhật snapshot của video gặp lại nhưng không tải lại MP4. Bản ghi lỗi giữ dữ liệu đã lấy và thử lại; lỗi ghi trong `archive/errors.jsonl`.
+`--discover-only` chỉ tìm và lưu danh sách. `--discovery-pages` giới hạn số phản hồi phân trang để kiểm tra, đồng thời bỏ bước quét kênh; mặc định không giới hạn. `--limit` giới hạn số video tải thành công, không giới hạn số ID được phát hiện.
 
-Giới hạn mặc định 20 video mới mỗi lượt; tìm tối đa 30 vòng cuộn và dừng khi không có kết quả mới. Có thể lưu ít hơn giới hạn. Hiện lấy theo thứ tự TikTok hiển thị trên trang hashtag, chưa xếp hạng toàn bộ hashtag theo lượt xem. Số liệu là ảnh chụp tại thời điểm thu thập.
+Cần Google Chrome và yt-dlp trong PATH; ffmpeg dùng khi ghép định dạng. Chrome dùng hồ sơ riêng `.chrome-profile/`. Nếu cần đăng nhập/xác minh, chạy `npm run login` hoặc bỏ `--auto` để thao tác trên Chrome. Chế độ auto báo lỗi khi gặp yêu cầu xác minh.
 
-Nếu phát hiện trang đăng nhập hoặc CAPTCHA giữa lượt chạy, tool đưa tab ra trước và chờ anh xử lý rồi nhấn Enter để tiếp tục. Việc phát hiện phụ thuộc cấu trúc trang TikTok; nếu thông báo xác minh thay đổi, tool có thể chưa nhận diện được. Tool dừng sau 5 video lỗi liên tiếp để tránh lặp hàng loạt lỗi. Không coi bản ghi thiếu video/bio là hoàn tất. Chưa xác minh tải đầu cuối trong chế độ khách.
+Mỗi video lưu trong `archive/@<username>/<id>/`: `video.mp4`, `metadata.json`, `channel.json`, `snapshots.jsonl`, `complete.json`. Video và hồ sơ Chrome không đưa lên Git. Chạy một collector/watch tại một thời điểm để tránh hai tiến trình ghi cùng hàng đợi.
 
-Tham khảo API trình duyệt: https://playwright.dev/docs/api/class-browsercontext
+Tổng posts Creative Center không phải cam kết số video truy cập được. Bộ lọc Việt Nam dùng tín hiệu metadata/ngôn ngữ/nội dung, không xác minh quốc tịch; có thể bỏ sót hoặc loại nhầm. `sourceRegion` là vùng khám phá, không phải quốc gia xác minh của tác giả. Chưa xác nhận có thể thu đủ toàn bộ posts của hashtag.
 
-Hồ sơ riêng giữ cookie và trạng thái xác minh nếu TikTok cấp; không sao chép hồ sơ Chrome cá nhân. Không chia sẻ thư mục hồ sơ. Thay đổi này chưa được xác nhận khắc phục Access Denied; nếu trang vẫn bị chặn, tool chờ và không thu thập.
+## Video tương thích Windows
+
+Video tải mới được kiểm tra và chuyển sang H.264 (yuv420p) + AAC trước khi hoàn tất. File để xem là `video.mp4`; nếu phải chuyển mã, bản gốc giữ ở `video-original.mp4`. File đã tương thích không bị mã hóa lại. Cần `ffmpeg` và `ffprobe` trong PATH.
+
+Chuyển kho cũ bằng `npm run convert:archive`. Script chỉ xử lý bản ghi đã hoàn tất, giữ bản gốc và báo lỗi riêng từng file. Không chạy hai lượt chuyển kho cùng lúc. Nếu bị tắt đột ngột, file `.convert.lock` còn lại cần kiểm tra tiến trình ffmpeg trước khi dọn và chạy lại.
+
+## Cấu trúc thư mục theo kênh
+
+```text
+archive/
+  @username/
+    channel.json
+    bio.txt
+    <video-id>/
+      video.mp4
+      metadata.json
+      snapshots.jsonl
+      complete.json
+      video-original.mp4 (nếu đã chuyển mã)
+```
+
+Metadata/bio kênh dùng chung ở thư mục `@username`. Bản `channel.json` cũ trong thư mục video được giữ lại khi di chuyển để bảo toàn dữ liệu lịch sử. `npm run migrate:archive` chuyển kho phẳng cũ sang cấu trúc này; collector cũng chuyển kho cũ khi khởi động. Công cụ chuyển codec hỗ trợ cấu trúc theo kênh. Dừng crawler và công cụ chuyển codec trước khi di chuyển kho.

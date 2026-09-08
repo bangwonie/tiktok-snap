@@ -8,8 +8,12 @@
     "watch": "node watch.mjs",
     "discover": "node discover.mjs",
     "login": "node collector.mjs --login",
-    "check": "node --check collector.mjs && node --check discover.mjs && node --check watch.mjs && node --check source-logic.mjs && node --check archive-logic.mjs && node --check content-filter.mjs",
-    "test": "node --test logic.test.mjs"
+    "check": "node --check collector.mjs && node --check discover.mjs && node --check watch.mjs && node --check source-logic.mjs && node --check archive-logic.mjs && node --check content-filter.mjs && node --check crawl-logic.mjs && node --check feed-queue.mjs && node --check media-compat.mjs && node --check convert-archive.mjs && node --check archive-layout.mjs && node --check migrate-archive.mjs",
+    "test": "node --test logic.test.mjs",
+    "convert:archive": "node convert-archive.mjs",
+    "migrate:archive": "node migrate-archive.mjs"
   },
-  "dependencies": { "playwright": "^1.58.0" }
+  "dependencies": {
+    "playwright": "^1.58.0"
+  }
 }

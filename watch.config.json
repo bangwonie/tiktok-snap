@@ -5,9 +5,9 @@
     { "region": "BR", "lang": "pt-BR", "tags": ["tiktokbrasil", "viralbrasil"] },
     { "region": "MX", "lang": "es-MX", "tags": ["tiktokmexico", "viralmexico"] }
   ],
-  "limitPerTag": 50,
+  "limitPerTag": "all",
   "intervalMinutes": 60,
-  "refreshSnapshots": true,
+  "refreshSnapshots": false,
   "creativeCenter": {
     "enabled": true,
     "periodDays": 7,
