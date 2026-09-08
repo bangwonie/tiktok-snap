@@ -139,6 +139,7 @@ async function downloadWithYtDlp(url, output) {
     await new Promise((resolve, reject) => {
       const child = spawn('yt-dlp', [
         '--no-playlist', '--no-progress', '--newline', '--impersonate', 'chrome',
+        '--retries', '2', '--fragment-retries', '2', '--retry-sleep', '1',
         '--cookies', cookieFile, '--merge-output-format', 'mp4',
         '--output', output, '--force-overwrites', url,
       ], { windowsHide: true });
@@ -152,6 +153,17 @@ async function downloadWithYtDlp(url, output) {
   } finally {
     await rm(cookieFile, { force: true });
   }
+}
+async function downloadFromBrowser(mediaUrl, referer, output) {
+  if (!mediaUrl || !/^https:\/\//.test(mediaUrl)) throw new Error('Browser metadata has no video URL.');
+  const response = await context.request.get(mediaUrl, { headers: { referer }, timeout: 60000 });
+  try {
+    if (!response.ok()) throw new Error(`Browser fallback HTTP ${response.status()}`);
+    const bytes = await response.body();
+    if (bytes.length < 12 || bytes.toString('ascii', 4, 8) !== 'ftyp') throw new Error('Browser fallback is not MP4.');
+    await writeFile(`${output}.part`, bytes);
+    await rename(`${output}.part`, output);
+  } finally { await response.dispose(); }
 }
 try {
   const marker = path.join(root, '.browser-profile', '.login-ready');
@@ -235,8 +247,17 @@ try {
           capturedAt: metadata.capturedAt, stats: metadata.stats ?? null,
         }) + '\n');
         if (!await exists(path.join(folder, 'video.mp4'))) {
-          await downloadWithYtDlp(url, path.join(folder, 'video.mp4'));
-          const bytes = await import('node:fs/promises').then(fs => fs.readFile(path.join(folder, 'video.mp4')));
+          const output = path.join(folder, 'video.mp4');
+          try {
+            await downloadWithYtDlp(url, output);
+          } catch (ytError) {
+            const media = item.video.playAddr || item.video.downloadAddr;
+            const mediaUrl = typeof media === 'string' ? media : media?.urlList?.[0];
+            console.warn(`${id}: yt-dlp loi, dang thu URL tu Chrome...`);
+            try { await downloadFromBrowser(mediaUrl, url, output); }
+            catch (fallbackError) { throw new Error(`${ytError.message}; fallback: ${fallbackError.message}`); }
+          }
+          const bytes = await import('node:fs/promises').then(fs => fs.readFile(output));
           if (bytes.length < 12 || bytes.toString('ascii', 4, 8) !== 'ftyp') {
             throw new Error('yt-dlp output is not a valid MP4.');
           }
@@ -251,16 +272,16 @@ try {
         saved++;
         consecutiveFailures = 0;
         console.log(`[${saved}/${limit}] ${completed ? 'Da cap nhat' : 'Da luu'} ${id} @${username}`);
-        await pause(7000 + Math.floor(Math.random() * 5000));
+        await pause(2500 + Math.floor(Math.random() * 2500));
       } catch (error) {
         failed++;
         consecutiveFailures++;
         const message = String(error.message).replace(/https?:\/\/\S+/g, '[URL]');
         console.error(`${id}: ${message}`);
         await appendFile(path.join(archive, 'errors.jsonl'), JSON.stringify({ id, at: new Date().toISOString(), error: message }) + '\n');
-        await pause(15000);
-        if (consecutiveFailures >= 5) {
-          console.error('Dung sau 5 loi lien tiep; TikTok co the dang chan truy cap khach.');
+        await pause(5000);
+        if (consecutiveFailures >= 10) {
+          console.error('Dung sau 10 loi lien tiep; TikTok co the dang chan truy cap.');
           break;
         }
       }
