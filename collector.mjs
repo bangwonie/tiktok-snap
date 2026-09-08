@@ -1,5 +1,5 @@
 import { chromium } from 'playwright';
-import { mkdir, writeFile, access, rename, appendFile, rm } from 'node:fs/promises';
+import { mkdir, writeFile, access, rename, appendFile, rm, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -123,6 +123,9 @@ async function json(file, data) {
   await writeFile(file + '.tmp', JSON.stringify(data, null, 2));
   await rename(file + '.tmp', file);
 }
+async function readJson(file) {
+  try { return JSON.parse(await readFile(file, 'utf8')); } catch { return null; }
+}
 async function downloadWithYtDlp(url, output) {
   const cookieFile = path.join(os.tmpdir(), `tiktok-snap-${randomUUID()}.cookies.txt`);
   const cookies = await context.cookies('https://www.tiktok.com');
@@ -203,6 +206,15 @@ try {
     }
     console.log(`Tim thay ${links.size} video cho #${tag}.`);
     if (!links.size) throw new Error('Khong tim thay video. Kiem tra trang TikTok/dang nhap/xac minh; giao dien co the da thay doi.');
+    const backlog = [];
+    for (const entry of await readdir(archive, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const oldFolder = path.join(archive, entry.name);
+      if (await exists(path.join(oldFolder, 'video.mp4'))) continue;
+      const oldMetadata = await readJson(path.join(oldFolder, 'metadata.json'));
+      if (oldMetadata?.url) backlog.push(oldMetadata.url);
+    }
+    if (backlog.length) console.log(`Retry ${backlog.length} video cu dang thieu file.`);
     const detail = await context.newPage();
     await detail.setExtraHTTPHeaders({ 'Accept-Language': `${language},en;q=0.8` });
     let saved = 0;
@@ -210,7 +222,7 @@ try {
     let consecutiveFailures = 0;
     // TikTok/Akamai rate-limits rapid detail navigations. Keep requests human-paced.
     const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
-    for (const url of links) {
+    for (const url of new Set([...backlog, ...links])) {
       if (saved >= limit) break;
       const id = url.match(/\/video\/(\d+)/)[1];
       const folder = path.join(archive, id);
@@ -240,7 +252,9 @@ try {
         await mkdir(folder, { recursive: true });
         const author = typeof item.author === 'object' ? item.author : { uniqueId: item.author };
         const username = author.uniqueId || url.match(/\/@([^/]+)/)[1];
-        const metadata = { id, url, tag, sourceRegion: region, language, capturedAt: new Date().toISOString(), caption: item.desc,
+        const previous = await readJson(path.join(folder, 'metadata.json'));
+        const metadata = { id, url, tag: previous?.tag || tag, sourceRegion: previous?.sourceRegion || region,
+          language: previous?.language || language, capturedAt: new Date().toISOString(), caption: item.desc,
           stats: item.stats, createTime: item.createTime, author: { username, nickname: author.nickname, bio: author.signature ?? null } };
         await json(path.join(folder, 'metadata.json'), metadata);
         await appendFile(path.join(folder, 'snapshots.jsonl'), JSON.stringify({
