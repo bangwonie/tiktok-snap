@@ -1,0 +1,7 @@
+node_modules/
+.browser-profile/
+.chrome-guest-profile/
+.chrome-profile/
+.creative-center-profile/
+discovered-sources.json
+archive/

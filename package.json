@@ -1,0 +1,14 @@
+{
+  "name": "tiktok-snap",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node collector.mjs",
+    "watch": "node watch.mjs",
+    "discover": "node discover.mjs",
+    "login": "node collector.mjs --login",
+    "check": "node --check collector.mjs && node --check discover.mjs && node --check watch.mjs"
+  },
+  "dependencies": { "playwright": "^1.58.0" }
+}

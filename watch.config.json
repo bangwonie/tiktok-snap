@@ -1,0 +1,19 @@
+{
+  "sources": [
+    { "region": "GLOBAL", "lang": "en", "tags": ["viral", "trending", "tiktokviral"] },
+    { "region": "US", "lang": "en-US", "tags": ["viralusa", "ustiktok", "americancreator"] },
+    { "region": "GB", "lang": "en-GB", "tags": ["uktiktok", "ukviral"] },
+    { "region": "BR", "lang": "pt-BR", "tags": ["tiktokbrasil", "viralbrasil"] },
+    { "region": "MX", "lang": "es-MX", "tags": ["tiktokmexico", "viralmexico"] }
+  ],
+  "limitPerTag": 50,
+  "intervalMinutes": 60,
+  "refreshSnapshots": true,
+  "creativeCenter": {
+    "enabled": true,
+    "periodDays": 7,
+    "topPerRegion": 3,
+    "countryCode": "GB",
+    "regions": ["US", "FR", "DE", "IT", "ES", "GB", "AR", "AU", "BR", "CA", "CO", "EG", "MX", "ZA"]
+  }
+}
