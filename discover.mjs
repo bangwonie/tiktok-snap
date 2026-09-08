@@ -2,6 +2,7 @@ import { chromium } from 'playwright';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { excludedSource } from './content-filter.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const config = JSON.parse(await readFile(path.join(root, 'watch.config.json'), 'utf8'));
@@ -10,7 +11,7 @@ if (!cc.enabled) process.exit(0);
 const requestedRegions = process.argv.find(arg => arg.startsWith('--region='))?.split('=')[1]
   ?.toUpperCase().split(',').map(value => value.trim()).filter(Boolean);
 const configuredRegions = cc.regions || [...new Set((config.sources || []).map(source => source.region))];
-const regions = configuredRegions.filter(region => !requestedRegions || requestedRegions.includes(region));
+const regions = configuredRegions.filter(region => !excludedSource({ region }) && (!requestedRegions || requestedRegions.includes(region)));
 const limit = Math.max(1, Number(cc.topPerRegion) || 3);
 const countryCode = String(cc.countryCode || 'GB').toUpperCase();
 const period = [7, 30, 120].includes(Number(cc.periodDays)) ? Number(cc.periodDays) : 7;

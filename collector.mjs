@@ -1,5 +1,5 @@
 import { chromium } from 'playwright';
-import { mkdir, writeFile, access, rename, appendFile, rm, readdir, readFile } from 'node:fs/promises';
+import { mkdir, writeFile, rename, appendFile, rm, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { isMp4, isComplete } from './archive-logic.mjs';
+import { excludedSource, vietnamReason } from './content-filter.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -16,16 +18,16 @@ const option = (key, fallback) => {
   const inline = args.find(value => value.startsWith(`${key}=`));
   return inline ? inline.slice(key.length + 1) : fallback;
 };
-const tag = option('--tag', 'fyp').replace(/^#/, '');
-const region = option('--region', 'GLOBAL').toUpperCase();
+const tag = option('--tag', 'viralusa').replace(/^#/, '');
+const region = option('--region', 'US').toUpperCase();
 const language = option('--lang', 'en');
+if (excludedSource({ tag, region, lang: language })) throw new Error('Nguon Viet Nam da bi loai khoi crawler.');
 const limit = Number(option('--limit', '20'));
 const autoMode = args.includes('--auto');
 const refreshMode = args.includes('--refresh');
 if (!tag || !Number.isInteger(limit) || limit < 1 || limit > 500) throw new Error('Use --tag fyp --limit 20 (limit: 1–500).');
 const archive = path.join(root, 'archive');
 await mkdir(archive, { recursive: true });
-const exists = async p => access(p).then(() => true, () => false);
 const prompt = async message => {
   const input = createInterface({ input: process.stdin, output: process.stdout });
   try { await input.question(message); } finally { input.close(); }
@@ -97,6 +99,7 @@ async function navigate(p, url) {
     await p.goto(url, { waitUntil: 'domcontentloaded' });
   } catch (error) {
     if (!/ERR_HTTP_RESPONSE_CODE_FAILURE|chrome-error:\/\//.test(error.message)) throw error;
+    if (autoMode) throw error;
     await p.bringToFront();
     await prompt('Loi truy cap TikTok. Kiem tra trang tren Chrome; khi mo lai duoc, nhan Enter (Ctrl+C de thoat): ');
   }
@@ -169,11 +172,12 @@ async function downloadFromBrowser(mediaUrl, referer, output) {
   } finally { await response.dispose(); }
 }
 try {
-  const marker = path.join(root, '.browser-profile', '.login-ready');
+  const marker = path.join(root, '.chrome-profile', '.login-ready');
   if (loginMode) {
-    await navigate(page, 'https://www.tiktok.com/login');
+    await page.goto('https://www.tiktok.com/login', { waitUntil: 'domcontentloaded' });
     await prompt('Anh dang nhap TikTok tren Chrome, sau do nhan Enter tai day: ');
     await gate(page);
+    await mkdir(path.dirname(marker), { recursive: true });
     await writeFile(marker, 'ready');
     if (args.includes('--login')) process.exitCode = 0;
   }
@@ -209,16 +213,19 @@ try {
     const backlog = [];
     for (const entry of await readdir(archive, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
+      if (!/^\d+$/.test(entry.name)) continue;
       const oldFolder = path.join(archive, entry.name);
-      if (await exists(path.join(oldFolder, 'video.mp4'))) continue;
+      if (await isComplete(oldFolder)) continue;
       const oldMetadata = await readJson(path.join(oldFolder, 'metadata.json'));
-      if (oldMetadata?.url) backlog.push(oldMetadata.url);
+      if (oldMetadata && (excludedSource({ region: oldMetadata.sourceRegion, lang: oldMetadata.language, tag: oldMetadata.tag }) || vietnamReason(oldMetadata))) continue;
+      if (typeof oldMetadata?.url === 'string' && /^https:\/\/www\.tiktok\.com\/@[^/]+\/video\/\d+$/.test(oldMetadata.url)) backlog.push(oldMetadata.url);
     }
     if (backlog.length) console.log(`Retry ${backlog.length} video cu dang thieu file.`);
     const detail = await context.newPage();
     await detail.setExtraHTTPHeaders({ 'Accept-Language': `${language},en;q=0.8` });
     let saved = 0;
     let failed = 0;
+    let excluded = 0;
     let consecutiveFailures = 0;
     // TikTok/Akamai rate-limits rapid detail navigations. Keep requests human-paced.
     const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -226,7 +233,7 @@ try {
       if (saved >= limit) break;
       const id = url.match(/\/video\/(\d+)/)[1];
       const folder = path.join(archive, id);
-      const completed = await exists(path.join(folder, 'complete.json'));
+      const completed = await isComplete(folder);
       if (completed && !refreshMode) continue;
       try {
         await navigate(detail, url);
@@ -249,6 +256,15 @@ try {
           await json(path.join(archive, `${id}-diagnostic.json`), diagnostic);
           throw new Error(`Video metadata unavailable after 12s; see ${id}-diagnostic.json (page: ${diagnostic.title}).`);
         }
+        const exclusionReason = vietnamReason(item);
+        if (exclusionReason) {
+          excluded++;
+          consecutiveFailures = 0;
+          console.log(`Bo qua ${id}: ${exclusionReason}`);
+          await appendFile(path.join(archive, 'excluded.jsonl'), JSON.stringify({ id, at: new Date().toISOString(), reason: exclusionReason }) + '\n');
+          await pause(2500);
+          continue;
+        }
         await mkdir(folder, { recursive: true });
         const author = typeof item.author === 'object' ? item.author : { uniqueId: item.author };
         const username = author.uniqueId || url.match(/\/@([^/]+)/)[1];
@@ -260,7 +276,7 @@ try {
         await appendFile(path.join(folder, 'snapshots.jsonl'), JSON.stringify({
           capturedAt: metadata.capturedAt, stats: metadata.stats ?? null,
         }) + '\n');
-        if (!await exists(path.join(folder, 'video.mp4'))) {
+        if (!await isMp4(path.join(folder, 'video.mp4'))) {
           const output = path.join(folder, 'video.mp4');
           try {
             await downloadWithYtDlp(url, output);
@@ -271,8 +287,7 @@ try {
             try { await downloadFromBrowser(mediaUrl, url, output); }
             catch (fallbackError) { throw new Error(`${ytError.message}; fallback: ${fallbackError.message}`); }
           }
-          const bytes = await import('node:fs/promises').then(fs => fs.readFile(output));
-          if (bytes.length < 12 || bytes.toString('ascii', 4, 8) !== 'ftyp') {
+          if (!await isMp4(output)) {
             throw new Error('yt-dlp output is not a valid MP4.');
           }
         }
@@ -301,7 +316,7 @@ try {
       }
       await detail.waitForTimeout(2000);
     }
-    console.log(`Hoan tat: ${saved} video moi; ${failed} loi. Kho: ${archive}`);
+    console.log(`Hoan tat: ${saved} video; ${excluded} bi loai (VN); ${failed} loi. Kho: ${archive}`);
     if (failed && !saved) process.exitCode = 1;
   }
 } finally { await browser.close(); }

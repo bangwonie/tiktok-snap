@@ -1,6 +1,5 @@
 {
   "sources": [
-    { "region": "GLOBAL", "lang": "en", "tags": ["viral", "trending", "tiktokviral"] },
     { "region": "US", "lang": "en-US", "tags": ["viralusa", "ustiktok", "americancreator"] },
     { "region": "GB", "lang": "en-GB", "tags": ["uktiktok", "ukviral"] },
     { "region": "BR", "lang": "pt-BR", "tags": ["tiktokbrasil", "viralbrasil"] },

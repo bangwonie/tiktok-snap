@@ -2,34 +2,34 @@ import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { mergeSources } from './source-logic.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const config = JSON.parse(await readFile(path.join(root, 'watch.config.json'), 'utf8'));
 const interval = Math.max(5, Number(config.intervalMinutes) || 60) * 60_000;
 let firstRun = true;
 
-const flatten = groups => (groups || []).flatMap(source => (source.tags || []).map(tag => ({
-  tag, region: source.region || 'GLOBAL', lang: source.lang || 'en',
-})));
-
 function childProcess(script, args = []) {
   return new Promise(resolve => {
     const child = spawn(process.execPath, [script, ...args], { cwd: root, stdio: 'inherit' });
+    child.on('error', error => { console.error(error.message); resolve(1); });
     child.on('exit', code => resolve(code ?? 1));
   });
 }
 
 async function cycleSources() {
+  let discovered = [];
   if (config.creativeCenter?.enabled) {
     const code = await childProcess('discover.mjs');
     if (code) console.error('Creative Center discovery loi; dung danh sach nguon co dinh.');
+    else {
+      try { discovered = JSON.parse(await readFile(path.join(root, 'discovered-sources.json'), 'utf8')); }
+      catch { console.error('Khong doc duoc ket qua discovery; dung nguon co dinh.'); }
+    }
   }
-  let discovered = [];
-  try { discovered = JSON.parse(await readFile(path.join(root, 'discovered-sources.json'), 'utf8')); } catch { /* first run/offline */ }
   // Dynamic Creative Center rows take priority. A hashtag is crawled only once
   // even if it appears in several regions.
-  const combined = [...flatten(discovered), ...flatten(config.sources)];
-  return [...new Map(combined.map(source => [source.tag.toLowerCase(), source])).values()];
+  return mergeSources(Array.isArray(discovered) ? discovered : [], config.sources);
 }
 
 function run(source) {
@@ -38,6 +38,7 @@ function run(source) {
     if (!firstRun) args.push('--auto');
     if (config.refreshSnapshots) args.push('--refresh');
     const child = spawn(process.execPath, args, { cwd: root, stdio: 'inherit' });
+    child.on('error', error => { console.error(error.message); resolve(1); });
     child.on('exit', code => resolve(code ?? 1));
   });
 }
