@@ -1,5 +1,5 @@
 ﻿import { spawn } from 'node:child_process';
-import { access, rename, rm, open } from 'node:fs/promises';
+import { access, rename, rm, open, copyFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 
 export function runMedia(command, args) {
@@ -21,30 +21,45 @@ export function compatible(info) {
     info.streams.filter(s => s.codec_type === 'audio').every(s => s.codec_name === 'aac');
 }
 const exists = file => access(file).then(() => true, () => false);
-export async function ensureCompatible(file) {
-  const lockPath = file + '.convert.lock';
+const disposable = name => ['video.mp4', 'video-h264.mp4', 'video-compatible.tmp.mp4', 'metadata.json', 'snapshots.jsonl', 'complete.json', 'channel.json'].includes(name) || /^video.*\.(part|ytdl)$/.test(name);
+export async function finalizeVideo(folder) {
+  const final = path.join(folder, 'video-original.mp4');
+  const temporary = path.join(folder, 'video-finalizing.tmp.mp4');
+  const lockPath = path.join(folder, '.finalize.lock');
   const lock = await open(lockPath, 'wx');
-  const temporary = path.join(path.dirname(file), 'video-compatible.tmp.mp4');
-  const original = path.join(path.dirname(file), 'video-original.mp4');
   try {
-    // Recover a conversion interrupted between the two renames.
-    if (!await exists(file) && await exists(original)) {
-      const { copyFile } = await import('node:fs/promises');
-      await copyFile(original, file);
+    let source, info;
+    // Prefer an already compatible copy, but validate it before removing anything.
+    const candidates = [];
+    for (const name of ['video-original.mp4', 'video.mp4', 'video-h264.mp4']) {
+      const file = path.join(folder, name);
+      if (!await exists(file)) continue;
+      try { candidates.push({ file, info: await probe(file) }); } catch { /* another copy may be intact */ }
     }
-    const before = await probe(file);
-    if (compatible(before)) return false;
-    if (await exists(original)) throw new Error(`Backup already exists: ${original}; refusing to overwrite`);
-    await runMedia('ffmpeg', ['-hide_banner', '-v', 'error', '-y', '-i', file,
-      '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-      '-threads', '4', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', temporary]);
-    const after = await probe(temporary);
-    if (!compatible(after) || Math.abs(Number(after.format.duration) - Number(before.format.duration)) > 1) throw new Error('Converted video failed validation');
-    await runMedia('ffmpeg', ['-hide_banner', '-v', 'error', '-i', temporary, '-f', 'null', '-']);
-    await rename(file, original);
-    try { await rename(temporary, file); }
-    catch (error) { await rename(original, file); throw error; }
-    return true;
+    const selected = candidates.find(c => compatible(c.info)) || candidates[0];
+    if (!selected) throw new Error('No readable video; files retained');
+    ({ file: source, info } = selected);
+    if (compatible(info)) {
+      if (source !== final) await copyFile(source, temporary);
+    } else {
+      const prefix = ['-hide_banner', '-v', 'error', '-y', '-i', source, '-map', '0:v:0', '-map', '0:a?'];
+      const suffix = ['-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', temporary];
+      try {
+        await runMedia('ffmpeg', [...prefix, '-c:v', 'h264_nvenc', '-preset', 'p4', '-cq', '20', '-b:v', '0', ...suffix]);
+      } catch {
+        await runMedia('ffmpeg', [...prefix, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-threads', '4', ...suffix]);
+      }
+    }
+    const candidate = source === final && compatible(info) ? final : temporary;
+    const after = await probe(candidate);
+    if (!compatible(after) || !Number.isFinite(Number(after.format.duration)) || Math.abs(Number(after.format.duration) - Number(info.format.duration)) > 1) throw new Error('Video failed validation; files retained');
+    await runMedia('ffmpeg', ['-hide_banner', '-v', 'error', '-xerror', '-i', candidate, '-f', 'null', '-']);
+    if (candidate !== final) await rename(temporary, final);
+    let removed = 0;
+    for (const entry of await readdir(folder, { withFileTypes: true })) {
+      if (entry.isFile() && disposable(entry.name)) { await rm(path.join(folder, entry.name)); removed++; }
+    }
+    return { converted: !compatible(info), removed };
   } finally {
     await rm(temporary, { force: true });
     await lock.close();
