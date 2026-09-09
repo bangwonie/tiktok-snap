@@ -5,3 +5,5 @@ node_modules/
 .creative-center-profile/
 discovered-sources.json
 archive/
+.dashboard-password
+.dashboard-passkeys.json

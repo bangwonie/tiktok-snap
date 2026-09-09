@@ -12,7 +12,10 @@ const requestedRegions = process.argv.find(arg => arg.startsWith('--region='))?.
   ?.toUpperCase().split(',').map(value => value.trim()).filter(Boolean);
 const configuredRegions = cc.regions || [...new Set((config.sources || []).map(source => source.region))];
 const regions = configuredRegions.filter(region => !excludedSource({ region }) && (!requestedRegions || requestedRegions.includes(region)));
-const limit = Math.max(1, Number(cc.topPerRegion) || 3);
+const configuredLimit = String(cc.topPerRegion ?? 'all').toLowerCase();
+const limit = configuredLimit === 'all' ? Infinity : Math.max(1, Number(configuredLimit) || 3);
+const idleScrolls = Math.max(3, Number(cc.idleScrolls) || 8);
+const maxScrolls = Math.max(idleScrolls, Number(cc.maxScrolls) || 200);
 const countryCode = String(cc.countryCode || 'GB').toUpperCase();
 const period = [7, 30, 120].includes(Number(cc.periodDays)) ? Number(cc.periodDays) : 7;
 const browser = await chromium.launch({ headless: false, channel: 'chrome', chromiumSandbox: true });
@@ -33,28 +36,44 @@ try {
         const close = page.locator('[aria-label*="close" i], [data-e2e*="close" i]').first();
         if (await close.isVisible({ timeout: 500 }).catch(() => false)) await close.click({ timeout: 1000 }).catch(() => {});
       }
-      // Public rows are available without login. "View more" can redirect to login,
-      // so only scroll the public table and never click it.
-      for (let i = 0; i < 3; i++) { await page.mouse.wheel(0, 900); await page.waitForTimeout(900); }
-      await page.waitForLoadState('domcontentloaded').catch(() => {});
-      const rows = await page.locator('[data-index]').evaluateAll((nodes, max) => nodes
-        .map(node => node.innerText.split('\n').map(value => value.trim()).filter(Boolean))
-        .filter(parts => parts.some(value => value === 'See analytics') && parts.some(value => value.startsWith('#')))
-        .map(parts => {
-          const tagAt = parts.findIndex(value => value.startsWith('#'));
-          const postsAt = parts.indexOf('Posts');
-          const viewsAt = parts.indexOf('Views');
-          return {
-            rank: Number(parts[0]),
-            tag: parts[tagAt].slice(1),
-            category: tagAt >= 0 && parts[tagAt + 1] !== parts[postsAt - 1] ? parts[tagAt + 1] : null,
-            posts: postsAt > 0 ? parts[postsAt - 1] : null,
-            views: viewsAt > 0 ? parts[viewsAt - 1] : null,
-          };
-        })
-        .filter(row => row.tag && Number.isFinite(row.rank))
-        .sort((a, b) => a.rank - b.rank)
-        .slice(0, max), limit);
+      // Gather every public row while scrolling. The table may virtualize old
+      // rows, so merge each visible batch instead of reading only at the end.
+      const found = new Map();
+      let idle = 0;
+      for (let scroll = 0; scroll < maxScrolls && idle < idleScrolls; scroll++) {
+        const rows = await page.locator('[data-index]').evaluateAll(nodes => nodes
+          .map(node => node.innerText.split('\n').map(value => value.trim()).filter(Boolean))
+          .filter(parts => parts.some(value => value === 'See analytics') && parts.some(value => value.startsWith('#')))
+          .map(parts => {
+            const tagAt = parts.findIndex(value => value.startsWith('#'));
+            const postsAt = parts.indexOf('Posts');
+            const viewsAt = parts.indexOf('Views');
+            return {
+              rank: Number(parts[0]),
+              tag: parts[tagAt].slice(1),
+              category: tagAt >= 0 && parts[tagAt + 1] !== parts[postsAt - 1] ? parts[tagAt + 1] : null,
+              posts: postsAt > 0 ? parts[postsAt - 1] : null,
+              views: viewsAt > 0 ? parts[viewsAt - 1] : null,
+            };
+          }).filter(row => row.tag && Number.isFinite(row.rank)));
+        let added = 0;
+        for (const row of rows) {
+          const key = `${row.rank}:${row.tag.toLowerCase()}`;
+          if (!found.has(key)) { found.set(key, row); added++; }
+        }
+        idle = added ? 0 : idle + 1;
+        if (idle >= idleScrolls) break;
+        await page.evaluate(() => {
+          window.scrollTo(0, document.body.scrollHeight);
+          for (const node of document.querySelectorAll('main, [class*="table" i], [class*="list" i]')) {
+            if (node.scrollHeight > node.clientHeight) node.scrollTop = node.scrollHeight;
+          }
+        });
+        await page.mouse.wheel(0, 1800);
+        await page.waitForTimeout(1000);
+      }
+      const allRows = [...found.values()].sort((a, b) => a.rank - b.rank);
+      const rows = Number.isFinite(limit) ? allRows.slice(0, limit) : allRows;
       output.push({ region, countryCode, lang: source.lang || 'en', tags: rows.map(row => row.tag), rows, discoveredAt: new Date().toISOString(), url });
       console.log(`${region}: ${rows.map(row => `#${row.tag} (${row.posts} posts, ${row.views} views)`).join(', ') || 'khong co du lieu'}`);
     } catch (error) {

@@ -6,12 +6,21 @@
     { "region": "MX", "lang": "es-MX", "tags": ["tiktokmexico", "viralmexico"] }
   ],
   "limitPerTag": "all",
+  "failureCooldownSeconds": 60,
+  "profilePageBudget": "all",
+  "profileNoAddPages": "all",
+  "profileBacklogLimit": 8,
+  "downloadConcurrency": 3,
+  "verifyConcurrency": 2,
   "intervalMinutes": 60,
   "refreshSnapshots": false,
   "creativeCenter": {
     "enabled": true,
+    "cacheMinutes": 720,
     "periodDays": 7,
-    "topPerRegion": 3,
+    "topPerRegion": "all",
+    "idleScrolls": 8,
+    "maxScrolls": 200,
     "countryCode": "GB",
     "regions": ["US", "FR", "DE", "IT", "ES", "GB", "AR", "AU", "BR", "CA", "CO", "EG", "MX", "ZA"]
   }

@@ -8,10 +8,15 @@ import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { createWriteStream } from 'node:fs';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { isMp4, isComplete } from './archive-logic.mjs';
-import { ensureCompatible } from './media-compat.mjs';
-import { listVideos, videoFolder, saveChannel, migrateArchive } from './archive-layout.mjs';
+import { finalizeVideo } from './media-compat.mjs';
+import { channelFolder, listVideos, videoFolder, saveChannel, migrateArchive } from './archive-layout.mjs';
 import { excludedSource, vietnamReason } from './content-filter.mjs';
+import { createLimiter } from './concurrency.mjs';
+import { channelMetadata } from './channel-metadata.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -30,6 +35,26 @@ const limit = limitOption === 'all' ? Infinity : Number(limitOption);
 const autoMode = args.includes('--auto');
 const discoveryOnly = args.includes('--discover-only');
 const discoveryPages = Number(option('--discovery-pages', 'Infinity'));
+const failureCooldownSeconds = Math.max(10, Number(option('--failure-cooldown', '60')) || 60);
+const profileLimit = (key, fallback = 'all') => {
+  const value = String(option(key, fallback)).toLowerCase();
+  if (value === 'all' || value === 'infinity') return Infinity;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) throw new Error(`Invalid ${key}; use all or a positive integer.`);
+  return parsed;
+};
+const profilePageBudget = profileLimit('--profile-page-budget');
+const profileNoAddPages = profileLimit('--profile-no-add-pages');
+const profileBacklogLimit = Math.max(0, Number(option('--profile-backlog-limit', '8')) || 0);
+const concurrencyOption = (key, fallback, maximum) => {
+  const parsed = Number(option(key, String(fallback)));
+  if (!Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
+    throw new Error(`Invalid ${key}; use an integer from 1 to ${maximum}.`);
+  }
+  return parsed;
+};
+const downloadConcurrency = concurrencyOption('--download-concurrency', 3, 8);
+const verifyConcurrency = concurrencyOption('--verify-concurrency', 2, 4);
 if (!(discoveryPages > 0) || (discoveryPages !== Infinity && !Number.isSafeInteger(discoveryPages))) throw new Error('Invalid --discovery-pages');
 let stopDiscovery = false;
 let producer;
@@ -173,14 +198,34 @@ async function downloadWithYtDlp(url, output) {
 }
 async function downloadFromBrowser(mediaUrl, referer, output) {
   if (!mediaUrl || !/^https:\/\//.test(mediaUrl)) throw new Error('Browser metadata has no video URL.');
-  const response = await context.request.get(mediaUrl, { headers: { referer }, timeout: 60000 });
+  const temporary = `${output}.part`;
+  const cookies = await context.cookies(mediaUrl);
+  const cookie = cookies.map(item => `${item.name}=${item.value}`).join('; ');
+  const response = await fetch(mediaUrl, {
+    headers: {
+      referer,
+      'user-agent': await context.pages()[0]?.evaluate(() => navigator.userAgent).catch(() => '') || 'Mozilla/5.0',
+      ...(cookie ? { cookie } : {}),
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(10 * 60_000),
+  });
   try {
-    if (!response.ok()) throw new Error(`Browser fallback HTTP ${response.status()}`);
-    const bytes = await response.body();
-    if (bytes.length < 12 || bytes.toString('ascii', 4, 8) !== 'ftyp') throw new Error('Browser fallback is not MP4.');
-    await writeFile(`${output}.part`, bytes);
-    await rename(`${output}.part`, output);
-  } finally { await response.dispose(); }
+    if (!response.ok || !response.body) throw new Error(`Browser media HTTP ${response.status}`);
+    await rm(temporary, { force: true });
+    await pipeline(Readable.fromWeb(response.body), createWriteStream(temporary));
+    if (!await isMp4(temporary)) throw new Error('Browser media response is not MP4.');
+    await rename(temporary, output);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
+}
+
+function mediaUrls(item) {
+  const values = [item?.video?.playAddr, item?.video?.downloadAddr];
+  const urls = values.flatMap(value => typeof value === 'string' ? [value] : value?.urlList || []);
+  return [...new Set(urls.filter(value => typeof value === 'string' && /^https:\/\//.test(value)))];
 }
 try {
   const marker = path.join(root, '.chrome-profile', '.login-ready');
@@ -215,68 +260,177 @@ try {
     if (backlog.length) console.log(`Retry ${backlog.length} video cu dang thieu file.`);
     const detail = await context.newPage();
     await detail.setExtraHTTPHeaders({ 'Accept-Language': `${language},en;q=0.8` });
+    const runFallback = createLimiter(1);
+    const runVerify = createLimiter(verifyConcurrency);
+    const runChannelWrite = createLimiter(1);
     let saved = 0;
     let failed = 0;
     let excluded = 0;
+    let deferredMedia = 0;
     let consecutiveFailures = 0;
+    let failureBursts = 0;
+    let cooldownUntil = 0;
     // TikTok/Akamai rate-limits rapid detail navigations. Keep requests human-paced.
     const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const waitForCooldown = async () => {
+      const remaining = cooldownUntil - Date.now();
+      if (remaining > 0) await pause(remaining);
+    };
+    console.log(`Downloader pool: ${downloadConcurrency} media; ${verifyConcurrency} FFmpeg; 1 page/yt-dlp fallback.`);
     const queue = await CrawlQueue.open(archive, tag, region);
+    let removedUnavailable = 0;
+    for (const job of Object.values(queue.data.jobs)) {
+      if (job.status !== 'excluded' || job.reason !== 'video-unavailable') continue;
+      const oldFolder = videoIndex.get(job.id);
+      if (!oldFolder || await isComplete(oldFolder)) continue;
+      const relative = path.relative(archive, oldFolder);
+      if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error(`Unsafe archive cleanup path: ${oldFolder}`);
+      await rm(oldFolder, { recursive: true, force: true });
+      videoIndex.delete(job.id);
+      removedUnavailable++;
+    }
+    if (removedUnavailable) console.log(`Da xoa ${removedUnavailable} thu muc video khong con phat duoc/khong con cong khai.`);
     for (const url of backlog) {
       const id = url.match(/\/video\/(\d+)/)[1];
       if (!queue.data.jobs[id]) queue.data.jobs[id] = { id, url, status: 'pending', source: 'archive' };
       else if (queue.data.jobs[id].status === 'done') queue.data.jobs[id].status = 'pending';
     }
     await queue.save();
+    const pendingDownloads = () => Object.values(queue.data.jobs)
+      .filter(job => job.status === 'pending' && (items.has(job.id) || job.item)).length;
+    const waitForProfileCapacity = async () => {
+      let announced = false;
+      while (!stopDiscovery && pendingDownloads() > profileBacklogLimit) {
+        if (!announced) {
+          console.log(`Uu tien tai video: tam dung quet kenh khi con ${pendingDownloads()} video dang cho.`);
+          announced = true;
+        }
+        await pause(1000);
+      }
+      if (announced && !stopDiscovery) console.log('Queue da ha xuong nguong; tiep tuc vet kenh.');
+    };
     discoveryPage = await context.newPage();
     await discoveryPage.setExtraHTTPHeaders({ 'Accept-Language': `${language},en;q=0.8` });
     let discoveryDone = false;
-    let discoveryError;
+    const discoveryErrors = [];
     producer = (async () => {
-      await discoverFeed({ page: discoveryPage, queue, source: `tag:${tag}`, url: `https://www.tiktok.com/tag/${encodeURIComponent(tag)}?lang=${encodeURIComponent(language)}`,
-        gate, stopped: () => stopDiscovery, maxPages: discoveryPages });
+      try {
+        await discoverFeed({ page: discoveryPage, queue, source: `tag:${tag}`, url: `https://www.tiktok.com/tag/${encodeURIComponent(tag)}?lang=${encodeURIComponent(language)}`,
+          gate, stopped: () => stopDiscovery, maxPages: discoveryPages, maxIdle: 30, cursorRetries: 4 });
+      } catch (error) {
+        discoveryErrors.push(`tag:${tag}: ${error.message}`);
+        console.error(`Quet hashtag #${tag} loi; van tiep tuc quet cac kenh da tim thay: ${error.message}`);
+      }
       if (!args.includes('--no-profiles') && !stopDiscovery && discoveryPages === Infinity) {
-        for (const username of Object.keys(queue.data.authors)) {
+        const authors = Object.keys(queue.data.authors);
+        console.log(`Bat dau SUPER SWEEP ${authors.length} kenh tu #${tag}: lay toan bo video cong khai den hasMore=false.`);
+        for (const [index, username] of authors.entries()) {
           if (stopDiscovery) break;
-          await discoverFeed({ page: discoveryPage, queue, source: `user:${username}`, profile: true,
-            url: `https://www.tiktok.com/@${encodeURIComponent(username)}`, gate, stopped: () => stopDiscovery });
+          const profileSource = `user:${username}`;
+          try {
+            await waitForProfileCapacity();
+            await discoverFeed({ page: discoveryPage, queue, source: profileSource, profile: true,
+              url: `https://www.tiktok.com/@${encodeURIComponent(username)}`, gate, stopped: () => stopDiscovery,
+              maxPages: profilePageBudget, maxIdle: 15, maxNoAddPages: profileNoAddPages,
+              cursorRetries: 4, beforeNextPage: waitForProfileCapacity });
+          } catch (error) {
+            discoveryErrors.push(`user:${username}: ${error.message}`);
+            console.error(`Bo qua loi kenh @${username} (${index + 1}/${authors.length}): ${error.message}`);
+          }
+          const profileState = queue.data.sources[profileSource];
+          if (profileState) {
+            const updatedAt = new Date().toISOString();
+            await runChannelWrite(() => saveChannel(channelFolder(archive, username), {
+              username,
+              url: `https://www.tiktok.com/@${encodeURIComponent(username)}`,
+              superSweep: {
+                status: profileState.status,
+                cursor: profileState.cursor ?? null,
+                hasMore: profileState.hasMore ?? null,
+                videosFoundOnProfile: Object.values(queue.data.jobs).filter(job => job.source === profileSource).length,
+                sourceTag: tag,
+                sourceRegion: region,
+                updatedAt,
+                ...(profileState.status === 'exhausted' ? { completedAt: updatedAt } : {}),
+              },
+              capturedAt: updatedAt,
+            }));
+          }
+          if (!stopDiscovery) await pause(1500);
         }
       }
-    })().catch(error => { discoveryError = error; }).finally(() => { discoveryDone = true; });
+    })().catch(error => { discoveryErrors.push(`unexpected: ${error.message}`); }).finally(() => { discoveryDone = true; });
     async function* queuedUrls() {
       const attempted = new Set();
       while (true) {
-        const pending = Object.values(queue.data.jobs).filter(job => ['pending', 'failed'].includes(job.status) && !attempted.has(job.id));
-        for (const job of pending) { attempted.add(job.id); yield job.url; }
-        if (discoveryDone) return;
+        const jobs = Object.values(queue.data.jobs);
+        const pending = ['pending', 'failed', 'retry'].flatMap(status =>
+          jobs.filter(job => job.status === status && !attempted.has(job.id)));
+        // A restarted queue can contain old IDs before their profile API page is
+        // replayed. Wait for that API metadata instead of opening every detail
+        // page, which quickly triggers TikTok/Akamai navigation rate limits.
+        const ready = pending.filter(job => items.has(job.id) || job.item);
+        for (const job of ready) { attempted.add(job.id); yield job.url; }
+        if (discoveryDone) {
+          const deferred = pending.filter(job => !items.has(job.id) && !job.item);
+          if (deferred.length) {
+            const updatedAt = new Date().toISOString();
+            for (const job of deferred) {
+              job.status = 'retry';
+              job.retryReason = 'awaiting-feed-metadata';
+              job.updatedAt = updatedAt;
+            }
+            await queue.save();
+            console.warn(`${deferred.length} video chua co metadata API; giu lai retry, khong mo trang chi tiet de tranh bi TikTok chan.`);
+          }
+          return;
+        }
         await pause(500);
       }
     }
     if (discoveryOnly) { await producer; console.log(`Queue: ${Object.keys(queue.data.jobs).length} IDs; ${queue.file}`); }
-    for await (const url of discoveryOnly ? [] : queuedUrls()) {
-      if (saved >= limit) break;
+    async function processUrl(url) {
+      if (saved >= limit) return;
       const id = url.match(/\/video\/(\d+)/)[1];
       const folder = videoIndex.get(id) || videoFolder(archive, decodeURIComponent(new URL(url).pathname.split('/')[1].slice(1)), id);
       const completed = await isComplete(folder);
-      if (completed) { await ensureCompatible(path.join(folder, 'video.mp4')); await queue.mark(id, 'done'); continue; }
+      if (completed) { await queue.mark(id, 'done'); return; }
+      let usedFeedApi = false;
+      let fallbackProfile = null;
       try {
-        await navigate(detail, url);
-        await gate(detail);
-        let item;
-        for (let attempt = 0; attempt < 12; attempt++) {
-          collect(await state(detail));
-          item = items.get(id);
-          if (item) break;
-          await detail.waitForTimeout(1000);
-        }
+        await waitForCooldown();
+        let item = items.get(id) || queue.data.jobs[id]?.item;
         if (!item) {
+          await pause(250);
+          item = items.get(id) || queue.data.jobs[id]?.item;
+        }
+        usedFeedApi = !!item;
+        if (!item && !autoMode) await runFallback(async () => {
+          item = items.get(id);
+          if (item) { usedFeedApi = true; return; }
+          await navigate(detail, url);
           await gate(detail);
-          const diagnostic = await detail.evaluate(() => ({
-            title: document.title,
-            path: location.pathname,
-            scripts: [...document.querySelectorAll('script[id]')].map(s => s.id),
-            hasVideo: !!document.querySelector('video'),
-          }));
+          for (let attempt = 0; attempt < 12; attempt++) {
+            collect(await state(detail));
+            item = items.get(id);
+            if (item) break;
+            await pause(1000);
+          }
+          if (item && !item.authorStats) {
+            const authorId = typeof item.author === 'object' ? item.author.uniqueId : item.author;
+            fallbackProfile = find(await state(detail), value => value.user?.uniqueId === authorId && value.stats);
+          }
+        });
+        if (!item) {
+          const diagnostic = await runFallback(async () => {
+            await gate(detail);
+            return detail.evaluate(() => ({
+              title: document.title,
+              path: location.pathname,
+              scripts: [...document.querySelectorAll('script[id]')].map(s => s.id),
+              hasVideo: !!document.querySelector('video'),
+            }));
+          });
           await json(path.join(archive, `${id}-diagnostic.json`), diagnostic);
           throw new Error(`Video metadata unavailable after 12s; see ${id}-diagnostic.json (page: ${diagnostic.title}).`);
         }
@@ -285,10 +439,21 @@ try {
           await queue.mark(id, 'excluded');
           excluded++;
           consecutiveFailures = 0;
+          failureBursts = 0;
           console.log(`Bo qua ${id}: ${exclusionReason}`);
           await appendFile(path.join(archive, 'excluded.jsonl'), JSON.stringify({ id, at: new Date().toISOString(), reason: exclusionReason }) + '\n');
           await pause(2500);
-          continue;
+          return;
+        }
+        const availableMediaUrls = mediaUrls(item);
+        if (!availableMediaUrls.length && !await isMp4(path.join(folder, 'video.mp4'))) {
+          const job = queue.data.jobs[id];
+          job.status = 'retry';
+          job.retryReason = 'awaiting-media-url';
+          job.updatedAt = new Date().toISOString();
+          await queue.save();
+          deferredMedia++;
+          return;
         }
         await mkdir(folder, { recursive: true });
         const author = typeof item.author === 'object' ? item.author : { uniqueId: item.author };
@@ -303,52 +468,95 @@ try {
         }) + '\n');
         if (!await isMp4(path.join(folder, 'video.mp4'))) {
           const output = path.join(folder, 'video.mp4');
-          try {
-            await downloadWithYtDlp(url, output);
-          } catch (ytError) {
-            const media = item.video.playAddr || item.video.downloadAddr;
-            const mediaUrl = typeof media === 'string' ? media : media?.urlList?.[0];
-            console.warn(`${id}: yt-dlp loi, dang thu URL tu Chrome...`);
-            try { await downloadFromBrowser(mediaUrl, url, output); }
-            catch (fallbackError) { throw new Error(`${ytError.message}; fallback: ${fallbackError.message}`); }
+          let directError;
+          for (const mediaUrl of availableMediaUrls) {
+            try {
+              await downloadFromBrowser(mediaUrl, url, output);
+              directError = null;
+              console.log(`${id}: tai truc tiep tu media API.`);
+              break;
+            } catch (error) { directError = error; }
           }
           if (!await isMp4(output)) {
-            throw new Error('yt-dlp output is not a valid MP4.');
+            if (directError) console.warn(`${id}: media API loi, dang fallback yt-dlp...`);
+            try { await runFallback(() => downloadWithYtDlp(url, output)); }
+            catch (ytError) {
+              throw new Error(`${directError?.message || 'Feed has no usable media URL'}; ${ytError.message}`);
+            }
+          }
+          if (!await isMp4(output)) {
+            throw new Error('Downloaded output is not a valid MP4.');
           }
         }
-        await ensureCompatible(path.join(folder, 'video.mp4'));
         // Prefer author data embedded in the video response; avoid an extra profile navigation.
         const profileUrl = `https://www.tiktok.com/@${encodeURIComponent(username)}`;
-        const profile = find(await state(detail), v => v.user?.uniqueId === username && v.stats);
-        const bio = author.signature ?? profile?.user?.signature ?? null;
-        await saveChannel(path.dirname(folder), { username, url: profileUrl, bio,
-          nickname: profile?.user?.nickname ?? author.nickname, stats: profile?.stats ?? null, capturedAt: new Date().toISOString() });
-        await json(path.join(folder, 'complete.json'), { savedAt: new Date().toISOString() });
+        const profile = item.authorStats ? { user: author, stats: item.authorStats }
+          : fallbackProfile;
+        const channelAuthor = { ...author, ...(profile?.user || {}) };
+        await runChannelWrite(() => saveChannel(path.dirname(folder), channelMetadata({
+          author: channelAuthor,
+          stats: item.authorStats ?? profile?.stats ?? null,
+          username,
+          url: profileUrl,
+          tag,
+          region,
+          language,
+          capturedAt: new Date().toISOString(),
+        })));
+        await runVerify(() => finalizeVideo(folder));
         await queue.mark(id, 'done');
         saved++;
         consecutiveFailures = 0;
+        failureBursts = 0;
         console.log(`[${saved}/${limit === Infinity ? 'all' : limit}] Da luu ${id} @${username}`);
-        if (saved >= limit) break;
-        await pause(2500 + Math.floor(Math.random() * 2500));
+        if (saved >= limit) return;
+        await pause(usedFeedApi ? 500 + Math.floor(Math.random() * 500) : 2500 + Math.floor(Math.random() * 2500));
       } catch (error) {
         await queue.mark(id, 'failed');
         failed++;
         consecutiveFailures++;
+        let cooldown = 0;
+        if (consecutiveFailures >= 10) {
+          cooldown = Math.min(300, failureCooldownSeconds * 2 ** failureBursts);
+          failureBursts++;
+          consecutiveFailures = 0;
+          cooldownUntil = Math.max(cooldownUntil, Date.now() + cooldown * 1000);
+        }
         const message = String(error.message).replace(/https?:\/\/\S+/g, '[URL]');
         console.error(`${id}: ${message}`);
         await appendFile(path.join(archive, 'errors.jsonl'), JSON.stringify({ id, at: new Date().toISOString(), error: message }) + '\n');
         await pause(5000);
-        if (consecutiveFailures >= 10) {
-          console.error('Dung sau 10 loi lien tiep; TikTok co the dang chan truy cap.');
-          break;
+        if (cooldown) {
+          console.error(`TikTok co the dang chan tam thoi; nghi ${cooldown}s roi tiep tuc can quet.`);
+          await runFallback(() => detail.goto('about:blank')).catch(() => {});
+          await waitForCooldown();
         }
       }
-      await detail.waitForTimeout(2000);
+      await pause(usedFeedApi ? 250 : 2000);
     }
-    stopDiscovery = true;
+    if (!discoveryOnly) {
+      const iterator = queuedUrls()[Symbol.asyncIterator]();
+      let activeClaims = 0;
+      async function downloadWorker() {
+        while (true) {
+          while (limit !== Infinity && saved < limit && saved + activeClaims >= limit) await pause(50);
+          if (saved >= limit) return;
+          activeClaims++;
+          const next = await iterator.next();
+          if (next.done) { activeClaims--; return; }
+          try { await processUrl(next.value); }
+          finally { activeClaims--; }
+        }
+      }
+      await Promise.all(Array.from({ length: downloadConcurrency }, () => downloadWorker()));
+    }
+    if (saved >= limit && limit !== Infinity) stopDiscovery = true;
     await producer;
-    if (discoveryError) { console.error(`Discovery chua hoan tat: ${discoveryError.message}`); process.exitCode = 1; }
-    console.log(`Hoan tat: ${saved} video; ${excluded} bi loai (VN); ${failed} loi. Kho: ${archive}`);
+    if (discoveryErrors.length) {
+      console.error(`Discovery co ${discoveryErrors.length} nguon loi; cac nguon khac da tiep tuc va se retry o chu ky sau.`);
+      process.exitCode = 1;
+    }
+    console.log(`Hoan tat: ${saved} video; ${excluded} bi loai; ${deferredMedia} cho media API; ${failed} loi. Kho: ${archive}`);
     if (failed && !saved) process.exitCode = 1;
   }
 } finally { stopDiscovery = true; await producer; await discoveryPage?.close(); await browser.close(); }

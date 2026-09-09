@@ -1,4 +1,4 @@
-import { open, access } from 'node:fs/promises';
+import { open } from 'node:fs/promises';
 import path from 'node:path';
 
 export async function isMp4(file) {
@@ -15,7 +15,5 @@ export async function isMp4(file) {
 }
 
 export async function isComplete(folder) {
-  const present = file => access(path.join(folder, file)).then(() => true, () => false);
-  return await present('complete.json') && await present('metadata.json') &&
-    (await present('channel.json') || await present('../channel.json')) && await isMp4(path.join(folder, 'video.mp4'));
+  return isMp4(path.join(folder, 'video-original.mp4'));
 }

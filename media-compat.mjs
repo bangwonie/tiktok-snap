@@ -1,5 +1,5 @@
 ﻿import { spawn } from 'node:child_process';
-import { access, rename, rm, open, copyFile, readdir } from 'node:fs/promises';
+import { access, rename, rm, open, copyFile, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export function runMedia(command, args) {
@@ -21,20 +21,49 @@ export function compatible(info) {
     info.streams.filter(s => s.codec_type === 'audio').every(s => s.codec_name === 'aac');
 }
 const exists = file => access(file).then(() => true, () => false);
-const disposable = name => ['video.mp4', 'video-h264.mp4', 'video-compatible.tmp.mp4', 'metadata.json', 'snapshots.jsonl', 'complete.json', 'channel.json'].includes(name) || /^video.*\.(part|ytdl)$/.test(name);
+const finalName = 'video-original.mp4';
+const internal = name => name === '.finalize.lock' || name === 'video-finalizing.tmp.mp4';
+
+export async function acquireFinalizeLock(lockPath) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const lock = await open(lockPath, 'wx');
+      await lock.writeFile(JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }));
+      return lock;
+    } catch (error) {
+      if (error.code !== 'EEXIST' || attempt) throw error;
+      let owner;
+      try { owner = JSON.parse(await readFile(lockPath, 'utf8')); } catch { owner = null; }
+      let alive = false;
+      if (Number.isSafeInteger(owner?.pid) && owner.pid > 0) {
+        try { process.kill(owner.pid, 0); alive = true; } catch { /* stale owner */ }
+      }
+      if (alive) throw error;
+      await rm(lockPath, { force: true });
+    }
+  }
+}
+
 export async function finalizeVideo(folder) {
-  const final = path.join(folder, 'video-original.mp4');
+  const final = path.join(folder, finalName);
   const temporary = path.join(folder, 'video-finalizing.tmp.mp4');
   const lockPath = path.join(folder, '.finalize.lock');
-  const lock = await open(lockPath, 'wx');
+  const lock = await acquireFinalizeLock(lockPath);
   try {
     let source, info;
-    // Prefer an already compatible copy, but validate it before removing anything.
+    // Probe and fully decode every candidate before choosing it. A damaged H.264
+    // file can still have a valid MP4 header and must not hide a clean source.
     const candidates = [];
     for (const name of ['video-original.mp4', 'video.mp4', 'video-h264.mp4']) {
       const file = path.join(folder, name);
       if (!await exists(file)) continue;
-      try { candidates.push({ file, info: await probe(file) }); } catch { /* another copy may be intact */ }
+      try {
+        const candidateInfo = await probe(file);
+        await runMedia('ffmpeg', ['-hide_banner', '-v', 'error', '-xerror', '-i', file, '-f', 'null', '-']);
+        if (candidateInfo.streams.some(stream => stream.codec_type === 'video' && !stream.disposition?.attached_pic)) {
+          candidates.push({ file, info: candidateInfo });
+        }
+      } catch { /* another copy may be intact */ }
     }
     const selected = candidates.find(c => compatible(c.info)) || candidates[0];
     if (!selected) throw new Error('No readable video; files retained');
@@ -53,11 +82,18 @@ export async function finalizeVideo(folder) {
     const candidate = source === final && compatible(info) ? final : temporary;
     const after = await probe(candidate);
     if (!compatible(after) || !Number.isFinite(Number(after.format.duration)) || Math.abs(Number(after.format.duration) - Number(info.format.duration)) > 1) throw new Error('Video failed validation; files retained');
-    await runMedia('ffmpeg', ['-hide_banner', '-v', 'error', '-xerror', '-i', candidate, '-f', 'null', '-']);
+    // A byte-for-byte copy of a fully decoded compatible source does not need
+    // a second decode. Transcoded output still gets a complete decode check.
+    if (candidate !== source && !compatible(info)) {
+      await runMedia('ffmpeg', ['-hide_banner', '-v', 'error', '-xerror', '-i', candidate, '-f', 'null', '-']);
+    }
     if (candidate !== final) await rename(temporary, final);
     let removed = 0;
     for (const entry of await readdir(folder, { withFileTypes: true })) {
-      if (entry.isFile() && disposable(entry.name)) { await rm(path.join(folder, entry.name)); removed++; }
+      if (entry.name !== finalName && !internal(entry.name)) {
+        await rm(path.join(folder, entry.name), { recursive: entry.isDirectory(), force: true });
+        removed++;
+      }
     }
     return { converted: !compatible(info), removed };
   } finally {

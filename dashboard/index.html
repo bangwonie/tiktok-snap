@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TikTok Snap</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main id="login-view" class="login-view">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="login-form-side">
+        <a class="brand login-brand" href="/" aria-label="TikTok Snap">
+          <span class="brand-icon">S</span><span>TikTok Snap</span>
+        </a>
+        <div class="login-heading">
+          <p class="section-kicker">LOCAL ADMIN</p>
+          <h1 id="login-title">Welcome back</h1>
+          <p>Sign in to manage discovery, downloads and your local video archive.</p>
+        </div>
+        <form id="login-form">
+          <label for="username">Username</label>
+          <input id="username" name="username" autocomplete="username" value="admin" required>
+          <label for="password">Password</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+          <p id="login-error" class="form-error" role="alert"></p>
+          <button class="primary wide" type="submit">Sign in</button>
+        </form>
+        <div class="login-divider"><span>or</span></div>
+        <button id="passkey-login" class="passkey-button wide" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 8a5 5 0 1 0-4.6 5H12v2h2v2h2v-4.4A5 5 0 0 0 15 8Zm-6 2a2 2 0 1 1 0-4 2 2 0 0 1 0 4Z"/></svg>
+          Sign in with passkey
+        </button>
+        <p id="passkey-note" class="login-note">Uses Windows Hello on this computer.</p>
+      </div>
+      <aside class="login-context" aria-hidden="true">
+        <p class="context-label">SUPER SWEEP</p>
+        <h2>One place for the whole collection run.</h2>
+        <ul>
+          <li><span>01</span>Discover public sources</li>
+          <li><span>02</span>Expand every channel</li>
+          <li><span>03</span>Verify every video</li>
+        </ul>
+        <div class="context-status"><i></i> Local system only</div>
+      </aside>
+    </section>
+  </main>
+
+  <div id="dashboard-view" class="dashboard hidden">
+    <aside class="sidebar">
+      <a class="brand" href="#top" aria-label="TikTok Snap">
+        <span class="brand-icon">S</span><span>TikTok Snap</span>
+      </a>
+      <nav aria-label="Dashboard navigation">
+        <a class="active" href="#top">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 11 12 4l8 7v9h-6v-6h-4v6H4Z"/></svg><span>Overview</span>
+        </a>
+        <a href="#queue">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h9"/></svg><span>Queue</span>
+        </a>
+        <a href="#sources">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="7" cy="7" r="2"/><circle cx="17" cy="7" r="2"/><circle cx="12" cy="17" r="2"/><path d="m9 8 2 7m4-7-2 7"/></svg><span>Sources</span>
+        </a>
+        <a href="#terminal">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 8 4 4-4 4m6 0h6"/></svg><span>Terminal</span>
+        </a>
+      </nav>
+      <div class="sidebar-spacer"></div>
+      <div class="sidebar-help">
+        <span>Need a quick check?</span>
+        <a class="sidebar-check" href="#health">View system health</a>
+      </div>
+      <div class="sidebar-user">
+        <span class="avatar">A</span>
+        <div><strong id="session-user">admin</strong><small>Local administrator</small></div>
+        <button id="logout-button" class="icon-button" title="Sign out" aria-label="Sign out">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 5H5v14h5m4-3 4-4-4-4m4 4H9"/></svg>
+        </button>
+      </div>
+    </aside>
+
+    <main class="content" id="top">
+      <header class="page-header">
+        <div>
+          <h1>Overview</h1>
+          <p>Monitor the current Super Sweep and local archive.</p>
+        </div>
+        <div class="header-actions">
+          <button id="passkey-register" class="secondary compact-button">Add passkey</button>
+          <div class="local-pill"><span id="live-dot" class="live-dot"></span><span>Local</span><strong id="server-clock">--:--:--</strong></div>
+        </div>
+      </header>
+
+      <section class="metrics" aria-label="Archive metrics">
+        <article class="metric-card">
+          <div class="metric-top"><p>Active processes</p><span class="metric-icon green"><svg viewBox="0 0 24 24"><path d="M7 7h10v10H7zM3 9h4m10 0h4M3 15h4m10 0h4M9 3v4m6-4v4m-6 10v4m6-4v4"/></svg></span></div>
+          <strong id="metric-processes">0</strong><span id="metric-process-detail">No active workers</span>
+        </article>
+        <article class="metric-card">
+          <div class="metric-top"><p>Videos archived</p><span class="metric-icon blue"><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM10 9l5 3-5 3Z"/></svg></span></div>
+          <strong id="metric-videos">0</strong><span>Playable originals</span>
+        </article>
+        <article class="metric-card">
+          <div class="metric-top"><p>Channels collected</p><span class="metric-icon amber"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M5 20c.7-4 3-6 7-6s6.3 2 7 6"/></svg></span></div>
+          <strong id="metric-channels">0</strong><span>Public creator profiles</span>
+        </article>
+        <article class="metric-card">
+          <div class="metric-top"><p>Archive size</p><span class="metric-icon purple"><svg viewBox="0 0 24 24"><path d="M4 7h16v13H4zM3 4h18v3H3zm7 8h4"/></svg></span></div>
+          <strong id="metric-size">0 MB</strong><span id="metric-folder-detail">0 video IDs</span>
+        </article>
+      </section>
+
+      <section class="control-card">
+        <div class="run-status">
+          <span id="crawler-indicator" class="status-indicator"></span>
+          <div><p class="section-kicker">CURRENT RUN</p><h2 id="crawler-label">Checking status</h2><span id="crawler-detail">Synchronizing process status...</span></div>
+        </div>
+        <div class="run-mode"><span>Worker pool</span><strong>3 media / 2 verify</strong><small>Single fallback lane</small></div>
+        <div class="actions">
+          <button id="start-button" class="primary"><svg viewBox="0 0 24 24"><path d="m9 6 9 6-9 6Z"/></svg>Start sweep</button>
+          <button id="stop-button" class="danger"><svg viewBox="0 0 24 24"><path d="M7 7h10v10H7Z"/></svg>Stop</button>
+        </div>
+      </section>
+
+      <section class="workspace-grid">
+        <article id="queue" class="card queue-card">
+          <div class="card-heading"><div><p class="section-kicker">QUEUE</p><h2>Collection progress</h2></div><span id="queue-total" class="count-pill">0 IDs</span></div>
+          <div class="queue-list">
+            <div class="queue-row"><div><i class="queue-key done"></i><span><strong>Completed</strong><small>Verified and archived</small></span></div><b id="queue-done">0</b><progress id="bar-done" max="1" value="0"></progress></div>
+            <div class="queue-row"><div><i class="queue-key pending"></i><span><strong>Pending</strong><small>Waiting for a download lane</small></span></div><b id="queue-pending">0</b><progress id="bar-pending" max="1" value="0"></progress></div>
+            <div class="queue-row"><div><i class="queue-key failed"></i><span><strong>Retry needed</strong><small>Retained for the next attempt</small></span></div><b id="queue-failed">0</b><progress id="bar-failed" max="1" value="0"></progress></div>
+            <div class="queue-row"><div><i class="queue-key excluded"></i><span><strong>Excluded</strong><small>Filtered before archive</small></span></div><b id="queue-excluded">0</b><progress id="bar-excluded" max="1" value="0"></progress></div>
+          </div>
+        </article>
+
+        <article id="health" class="card health-card">
+          <div class="card-heading"><div><p class="section-kicker">SYSTEM HEALTH</p><h2>Service check</h2></div><span id="check-badge" class="badge neutral">Not run</span></div>
+          <div class="health-result"><strong id="health-score">--</strong><div><p id="health-title">Ready to verify</p><span id="health-detail">Run syntax checks and the complete test suite.</span></div></div>
+          <div class="health-note"><span>Checks</span><strong>Syntax + tests</strong></div>
+          <button id="check-button" class="secondary wide health-button">Run system check</button>
+        </article>
+      </section>
+
+      <section id="sources" class="card sources-card">
+        <div class="card-heading"><div><p class="section-kicker">DISCOVERY</p><h2>Recent sources</h2></div><span id="source-count" class="count-pill">0 sources</span></div>
+        <div class="table-wrap">
+          <table><thead><tr><th>Source</th><th>Queue</th><th>Cursor</th><th>Status</th><th>Updated</th></tr></thead><tbody id="source-rows"><tr><td colspan="5" class="empty">No source data yet.</td></tr></tbody></table>
+        </div>
+      </section>
+
+      <section id="terminal" class="terminal-card">
+        <header><div><span class="terminal-mark"></span><strong>Live activity</strong></div><div><button id="clear-terminal" class="terminal-action">Clear</button><button id="follow-terminal" class="terminal-action active">Following</button></div></header>
+        <div id="terminal-output" class="terminal-output" role="log" aria-live="polite"><p class="terminal-placeholder">Connecting to crawler output...</p></div>
+      </section>
+    </main>
+    <div id="toast" class="toast" role="status"></div>
+  </div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
